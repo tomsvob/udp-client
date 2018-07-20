@@ -2,6 +2,7 @@ import * as dgram from "dgram";
 import * as fs from "fs";
 import * as promiseFinally from "promise.prototype.finally";
 import * as assert from 'assert';
+import Timer = NodeJS.Timer;
 
 promiseFinally.shim();
 
@@ -92,6 +93,11 @@ class Packet {
     }
 
     public isValid(mode: ConnectionMode, id: number) {
+        if (this.ackNumber && (this.data.length || this.sequentialNumber)) {
+            // ack number has no other data
+            return false;
+        }
+
         switch (this.flag) {
             case ConnectionFlag.SYN:
                 return id === 0 && this.connectionIdentifier !== 0 && // valid id
@@ -116,14 +122,28 @@ class Packet {
     }
 }
 
+class Timeout {
+    private timeoutId?: Timer;
+
+    constructor(private handler: () => void, private TIME_OUT: number) {
+    }
+
+    stop() {
+        this.timeoutId && clearTimeout(this.timeoutId);
+    }
+
+    debounce() {
+        this.stop();
+        this.timeoutId = setTimeout(this.handler, this.TIME_OUT);
+    }
+}
+
 abstract class Connection {
-    private socket: dgram.Socket;
-    protected static PART_SIZE: number = 0xff;
-    protected static WINDOW_SIZE: number = 8;
+    private readonly socket: dgram.Socket;
+    public static PART_SIZE: number = 0xff;
+    public static WINDOW_SIZE: number = 8;
     protected connectionId: number = 0;
-    private socketMessageListenerBound = this.socketMessageListener.bind(this);
-    private timeoutId: number = 0;
-    private finTimeoutId: number = 0;
+    protected timeout = new Timeout(this.timeoutHandler.bind(this), TIMEOUT);
 
     protected constructor(
         private server: NetAddress,
@@ -132,7 +152,7 @@ abstract class Connection {
         private reject: (error: string) => void, // error cb
     ) {
         this.socket = dgram.createSocket('udp4');
-        this.socket.on('message', this.socketMessageListenerBound);
+        this.socket.on('message', this.socketMessageListener.bind(this));
         this.socket.on('listening', this.sendSynPacket.bind(this)); // initiate connection when ready
         this.socket.bind();
     }
@@ -143,16 +163,12 @@ abstract class Connection {
         this.processPacket(packet);
     }
 
-    private sendPacket(packet: Packet) {
-        return new Promise((res) => {
-            clearTimeout(this.timeoutId);
-            this.timeoutId = setTimeout(this.timeoutHandler.bind(this), TIMEOUT);
-            const buffer = packet.buffer;
-            this.socket.send(buffer, 0, buffer.length, this.server.port, this.server.host, (err) => {
-                assert(!err, 'sending packet on closed connection');
-                console.log('SENT', packet.toString());
-                res();
-            });
+    protected sendPacket(packet: Packet) {
+        this.timeout.debounce();
+        const buffer = packet.buffer;
+        this.socket.send(buffer, 0, buffer.length, this.server.port, this.server.host, (err) => {
+            assert(!err, 'sending packet on closed connection');
+            console.log('SENT', packet.toString());
         });
     }
 
@@ -160,26 +176,28 @@ abstract class Connection {
         return Packet.createFromParams(this.connectionId, seq, ack, flag, data)
     }
 
-    private createPacket(seq: number, ack: number, flag: ConnectionFlag) {
+    protected createPacket(seq: number, ack: number, flag: ConnectionFlag) {
         return this.createDataPacket(seq, ack, flag, Buffer.allocUnsafe(0));
+    }
+
+    protected sendRstPacket() {
+        this.sendPacket(this.createPacket(0, 0, ConnectionFlag.RST));
+    }
+
+    protected abstract sendFinPacket(seq: number): void;
+
+    protected sendAckPacket(ack: number) {
+        this.sendPacket(this.createPacket(0, ack, ConnectionFlag.DATA));
+    }
+
+    protected sendDataPacket(seq: number, data: Buffer) {
+        this.sendPacket(this.createDataPacket(seq, 0, ConnectionFlag.DATA, data));
     }
 
     protected sendSynPacket() {
         const buff = Buffer.alloc(1);
         buff.writeUInt8(this.COMMAND_TYPE, 0);
         this.sendPacket(this.createDataPacket(0, 0, ConnectionFlag.SYN, buff));
-    }
-
-    private sendRstPacket() {
-        this.sendPacket(this.createPacket(0, 0, ConnectionFlag.RST));
-    }
-
-    private sendFinPacket(seq: number) {
-        return this.sendPacket(this.createPacket(0, seq, ConnectionFlag.FIN));
-    }
-
-    protected sendAckPacket(ack: number) {
-        this.sendPacket(this.createPacket(0, ack, ConnectionFlag.DATA));
     }
 
     private processPacket(packet: Packet) {
@@ -191,15 +209,15 @@ abstract class Connection {
                 switch (packet.flag) {
                     case ConnectionFlag.SYN:
                         this.connectionId = packet.connectionIdentifier;
-                        console.log('accepted connection', this.connectionId);
+                        console.log('accepted connection', this.connectionId.toString(16));
+                        this.timeout.stop();
+                        this.processSynPacket(packet);
                         break;
                     case ConnectionFlag.RST:
                         this.forceCloseConnection('received RST flag');
                         break;
                     case ConnectionFlag.FIN:
-                        this.sendFinPacket(packet.sequentialNumber);
-                        clearTimeout(this.finTimeoutId);
-                        this.finTimeoutId = setTimeout(this.successCloseConnection.bind(this), TIMEOUT * 10);
+                        this.processFinPacket(packet);
                         break;
                     case ConnectionFlag.DATA:
                         this.processDataPacket(packet);
@@ -222,11 +240,15 @@ abstract class Connection {
     }
 
     private closeConnection() {
-        clearTimeout(this.timeoutId);
+        this.timeout.stop();
         this.socket.close();
     }
 
     protected abstract processDataPacket(packet: Packet): void;
+
+    protected abstract processFinPacket(packet: Packet): void;
+
+    protected abstract processSynPacket(packet: Packet): void;
 
     protected abstract timeoutHandler(): void;
 }
@@ -234,6 +256,7 @@ abstract class Connection {
 class DownloadConnection extends Connection {
     private lastSequentialNumber: number = 0;
     private window: Array<Buffer> = [];
+    private finTimeout = new Timeout(this.successCloseConnection.bind(this), TIMEOUT * 10);
 
     constructor(
         private passData: (data: Buffer) => void,
@@ -245,9 +268,9 @@ class DownloadConnection extends Connection {
         super(server, COMMAND_TYPE, resolve, reject);
     }
 
-    processDataPacket(packet: Packet): void {
+    protected processDataPacket(packet: Packet): void {
         const packetSeq = packet.sequentialNumber;
-        const windowPacketIndex = DownloadConnection.getPacketWindowIndex(packetSeq, this.lastSequentialNumber);
+        const windowPacketIndex = AutofillWindow.getPacketWindowIndex(packetSeq, this.lastSequentialNumber);
         console.log('index', windowPacketIndex, this.lastSequentialNumber, packetSeq);
 
         if (windowPacketIndex < 0 || this.window[windowPacketIndex] || windowPacketIndex >= Connection.WINDOW_SIZE) {
@@ -262,6 +285,18 @@ class DownloadConnection extends Connection {
         }
 
         this.sendAckPacket(this.lastSequentialNumber);
+    }
+
+    protected processFinPacket(packet: Packet): void {
+        this.sendFinPacket(packet.sequentialNumber);
+        this.finTimeout.debounce();
+    }
+
+    protected sendFinPacket(seq: number): void {
+        return this.sendPacket(this.createPacket(0, seq, ConnectionFlag.FIN));
+    }
+
+    protected processSynPacket(packet: Packet): void {
     }
 
     private consumeWindow() {
@@ -283,14 +318,6 @@ class DownloadConnection extends Connection {
         }
     }
 
-    private static getPacketWindowIndex(packetSeq: number, mySeq: number) {
-        return Math.ceil(DownloadConnection.fixOverflow(packetSeq - mySeq) / Connection.PART_SIZE);
-    }
-
-    private static fixOverflow(num: number) {
-        return num < 0 ? num + 0xffff : num;
-    }
-
     public static asPromise(
         passData: (data: Buffer) => void,
         server: NetAddress,
@@ -300,25 +327,159 @@ class DownloadConnection extends Connection {
             new DownloadConnection(passData, server, COMMAND_TYPE, res, rej);
         })
     }
+}
 
-    public static testStatic() {
-        assert(DownloadConnection.fixOverflow(1) === 1, 'fixOverflow');
-        assert(DownloadConnection.fixOverflow(0) === 0, 'fixOverflow');
-        assert(DownloadConnection.fixOverflow(-1) === 0xffff - 1, 'fixOverflow');
-        assert(DownloadConnection.fixOverflow(-0xff) === 0xff00, 'fixOverflow');
-        assert(DownloadConnection.getPacketWindowIndex(0, 0) === 0, 'gePacketWindowIndex');
-        assert(DownloadConnection.getPacketWindowIndex(0xffff, 0xffff) === 0, 'gePacketWindowIndex');
-        assert(DownloadConnection.getPacketWindowIndex(0xffff, 0xff00) === 1, 'gePacketWindowIndex');
+class AutoresolvedBuffer {
+    public promise: Promise<Buffer>;
+
+    constructor(
+        public offset: number,
+        private getData: (size: number) => Promise<Buffer>,
+    ) {
+        this.promise = getData(Connection.PART_SIZE);
     }
 }
 
-DownloadConnection.testStatic();
-
-
-class UploadConnection extends Connection {
+class AutofillWindow {
+    private window: AutoresolvedBuffer[] = [];
+    private nextDataOffset = 0; // for file reader only (probably will end up bigger then file size)
+    public eof = false;
+    public eofPosition: number = 0;
 
     constructor(
-        private getData: (offset: number, size: number) => Promise<Buffer>,
+        private sendData: (seq: number, buffer: Buffer) => void,
+        private getData: (size: number) => Promise<Buffer>,
+    ) {
+        for (let i = 0; i < Connection.WINDOW_SIZE; i++) {
+            // autofill window
+            this.window.push(this.getNextAutoresolver());
+        }
+    }
+
+    public get(i: number) {
+        return this.window[i];
+    }
+
+    public getSequence(seq: number) {
+        const index = AutofillWindow.getPacketWindowIndex(seq, this.nextSequence);
+        assert(index >= 0 && index < Connection.WINDOW_SIZE, `AutofillWindow.getSequence(${seq}) index(${index}) out of bounds`);
+        return this.get(index);
+    }
+
+    public sendSequence(seq: number) {
+        this.sendAutoresolver(this.getSequence(seq));
+    }
+
+    public get nextSequence(): number {
+        return this.get(0).offset;
+    }
+
+    public sendAll() {
+        console.log('force send whole window');
+        for (let i = 0; i < Connection.WINDOW_SIZE; i++) {
+            this.sendAutoresolver(this.get(i));
+        }
+    }
+
+    public acknowledge(ack: number) {
+        while (true) {
+            const index = AutofillWindow.getPacketWindowIndex(ack, this.get(0).offset);
+            if (index > 0 && index <= Connection.WINDOW_SIZE) {
+                console.log('acknowledge remove', index);
+                this.removeNext();
+            } else {
+                console.log('acknowledge ignore', index);
+                return;
+            }
+        }
+    }
+
+    public removeNext() {
+        console.log('removeNext frame', this.window[0].offset);
+        this.window.shift();
+        this.loadNextPart();
+    }
+
+    private sendAutoresolver(autoresolver: AutoresolvedBuffer) {
+        autoresolver.promise.then((buff: Buffer) => {
+            if (buff.length) {
+                this.sendData(AutofillWindow.getSequenceNumber(autoresolver.offset), buff);
+            }
+        });
+    }
+
+    private getNextAutoresolver(): AutoresolvedBuffer {
+        const autoresolver = new AutoresolvedBuffer(this.nextDataOffset, this.getData);
+        autoresolver.promise.then((buff: Buffer) => {
+            if (buff.length < Connection.PART_SIZE && !this.eof) {
+                this.eof = true;
+                this.eofPosition = autoresolver.offset + buff.length;
+            }
+        });
+        this.sendAutoresolver(autoresolver);
+        this.nextDataOffset += Connection.PART_SIZE;
+        return autoresolver;
+    }
+
+    private loadNextPart() {
+        const autoresolver = this.getNextAutoresolver();
+        this.window.push(autoresolver);
+        return autoresolver.promise;
+    }
+
+    private static getSequenceNumber(offset: number) {
+        return offset % 0x10000;
+    }
+
+    private static fixOverflow(num: number) {
+        return num < 0 ? num + 0xffff : num;
+    }
+
+    public static getPacketWindowIndex(packetSeq: number, mySeq: number) {
+        return Math.ceil(AutofillWindow.fixOverflow(packetSeq - mySeq) / Connection.PART_SIZE);
+    }
+}
+
+class AckController {
+    private lastAck: number = 0;
+    private count: number = 0;
+
+    constructor(private window: AutofillWindow, private timeout: Timeout) {
+    }
+
+    /**
+     * Handle ack number
+     * @param {number} ackNumber
+     * @returns {boolean} - is ackNumber valid
+     */
+    acknowledge(ackNumber: number): boolean {
+        this.window.acknowledge(ackNumber);
+
+        // if (this.lastAck > ackNumber) {
+        //     return false;} else
+        if (this.lastAck === ackNumber) {
+            this.count++;
+            if (this.count === 3) {
+                console.log('resend sequence', ackNumber);
+                this.window.sendSequence(ackNumber);
+                this.timeout.debounce();
+                this.count = 0; // reset counter
+            }
+        } else if (this.lastAck < ackNumber) {
+            this.lastAck = ackNumber;
+            this.count = 0;
+        }
+
+        return true;
+    }
+}
+
+class UploadConnection extends Connection {
+    private window?: AutofillWindow;
+    private ackController?: AckController;
+
+    constructor(
+        private getData: (size: number) => Promise<Buffer>,
         server: NetAddress,
         COMMAND_TYPE: ConnectionMode,
         resolve: () => void, // success cb
@@ -328,56 +489,70 @@ class UploadConnection extends Connection {
     }
 
     protected timeoutHandler(): void {
+        console.log('timeout');
         if (!this.connectionId) {
             this.sendSynPacket();
+        } else if (this.window) {
+            this.timeout.debounce();
+            this.window.sendAll();
+        } else {
+            assert(true, 'undefined timeout state');
         }
     }
 
-    processDataPacket(packet: Packet): void {
-        console.warn('stub'); // TODO: implement
+    protected processSynPacket(packet: Packet) {
+        this.window = new AutofillWindow(this.sendDataPacket.bind(this), this.getData);
+        this.ackController = new AckController(this.window, this.timeout);
+    }
+
+    protected sendFinPacket(seq: number): void {
+        return this.sendPacket(this.createPacket(seq, 0, ConnectionFlag.FIN));
+    }
+
+    processDataPacket(packet: Packet) {
+        if (!this.ackController || !this.window) {
+            console.warn('received data packet but connection undefined');
+            return;
+        }
+
+        console.log('received ack', packet.ackNumber, this.window.eof ? this.window.eofPosition : '');
+        if (this.window.eof && packet.ackNumber === (this.window.eofPosition % 0x10000)) {
+            this.sendFinPacket(this.window.eofPosition % 0x10000);
+        } else if (!this.window.eof) {
+            let valid = this.ackController.acknowledge(packet.ackNumber);
+            if (!valid) {
+                this.sendRstPacket();
+                this.forceCloseConnection(`ackNumber out of bounds: ack=${packet.ackNumber}`);
+            }
+        }
+    }
+
+    protected processFinPacket(packet: Packet): void {
+        this.successCloseConnection();
     }
 
     public static asPromise(
-        getData: (offset: number, size: number) => Promise<Buffer>,
+        getData: (size: number) => Promise<Buffer>,
         server: NetAddress,
         COMMAND_TYPE: ConnectionMode,
-    ): Promise<Buffer> {
-        return new Promise<Buffer>((res: () => void, rej: (error: string) => void) => {
+    ): Promise<void> {
+        return new Promise((res, rej: (error: string) => void) => {
             new UploadConnection(getData, server, COMMAND_TYPE, res, rej);
         });
     }
 }
 
-class Client {
+class File {
+    protected fd?: number;
+    protected fileReady: Promise<void>;
 
-    constructor(private server: NetAddress) {
+    constructor(path: string, flag: string) {
+        this.fileReady = File.getFileDescriptor(path, 'r').then((fd) => {
+            this.fd = fd;
+        });
     }
 
-    public downloadImage() {
-        Client.getFileDescriptor(DOWNLOAD_IMAGE_PATH, 'w')
-            .then((fd) => DownloadConnection.asPromise(
-                (data: Buffer) => Client.writeFilePart(fd, data),
-                this.server, ConnectionMode.DownloadImage)
-                .finally(() => Client.closeFileDescriptor(fd))
-            )
-            .then(() => console.log(`image is stored in file: ${DOWNLOAD_IMAGE_PATH}`))
-            .catch(console.error);
-    }
-
-    public uploadFirmware(filePath: string) {
-        Client.getFileDescriptor(filePath, 'r')
-            .then((fd: number): Promise<Buffer> =>
-                UploadConnection.asPromise(
-                    (offset: number, size: number) => Client.readFile(fd, offset, size),
-                    this.server, ConnectionMode.SendFirmware)
-                    .finally(() => Client.closeFileDescriptor(fd)))
-            .then((message: Buffer) => {
-                console.log('done');
-            })
-            .catch((err: string) => console.error(err));
-    }
-
-    private static getFileDescriptor(path: string, flags: string): Promise<number> {
+    public static getFileDescriptor(path: string, flags: string): Promise<number> {
         return new Promise<number>((res, rej) => {
             fs.open(path, flags, (status: NodeJS.ErrnoException, fd: number) => {
                 if (status) rej(`file cannot be accessed: ${path}`);
@@ -386,40 +561,80 @@ class Client {
         });
     }
 
-    private static closeFileDescriptor(fd: number) {
+    public static closeFileDescriptor(fd: number) {
         fs.close(fd, (err) => {
             assert(!err, err && err.message);
         });
     }
 
-    private static readFile(fd: number, offset: number, size: number): Promise<Buffer> {
-        const buffer = Buffer.allocUnsafe(size);
-        return new Promise((res) => {
-            fs.read(fd, buffer, 0, size, offset, (err: NodeJS.ErrnoException, bytesRead, buffer) => {
-                assert(!err, err && err.message);
-                res(buffer.slice(0, bytesRead));
-            })
-        });
+    public close() {
+        this.fd && File.closeFileDescriptor(this.fd);
+    }
+}
+
+class FileReader extends File {
+    private readChain: Promise<any> = Promise.resolve();
+    public ready: Promise<(size: number)=> Promise<Buffer>>;
+
+    constructor(path: string) {
+        super(path, 'r');
+        this.ready = this.fileReady.then(() => this.readPart.bind(this));
     }
 
-    private static writeFilePart(fd: number, buffer: Buffer) {
-        fs.write(fd, buffer, (err: NodeJS.ErrnoException) => {
+    private readPart(size: number): Promise<Buffer> {
+        const oldChain: Promise<Buffer> = this.readChain;
+        return this.readChain = new Promise<Buffer>((res: (msg: Buffer) => void, rej) => oldChain
+            .then(() => FileReader.readFilePart(<number> this.fd, size))
+            .then(res)
+            .catch(rej)
+        );
+    }
+
+    private static readFilePart(fd: number, size: number): Promise<Buffer> {
+        const buffer = Buffer.allocUnsafe(size);
+        return new Promise((res) => {
+            fs.read(fd, buffer, 0, size, null, (err: NodeJS.ErrnoException, bytesRead, buffer) => {
+                assert(!err, err && err.message);
+                res(buffer.slice(0, bytesRead));
+            });
+        });
+    }
+}
+
+class FileWriter extends File {
+    public ready: Promise<(buffer: Buffer)=> void>;
+    constructor(path: string) {
+        super(path, 'w');
+        this.ready = this.fileReady.then(() => this.writePart.bind(this));
+    }
+
+    private writePart(buffer: Buffer) {
+        fs.write(<number> this.fd, buffer, (err: NodeJS.ErrnoException) => {
             assert(!err, err && err.message);
         });
     }
+}
 
-    private static writeFile(path: string, buffer: Buffer): Promise<any> {
-        return new Promise((res, rej) =>
-            this.getFileDescriptor(path, 'w')
-                .then((fd) => {
-                    fs.write(fd, buffer, null, null, null, (err: NodeJS.ErrnoException) => {
-                        if (err) {
-                            rej(`could not write content to file: ${path}`);
-                        } else {
-                            res()
-                        }
-                    });
-                }));
+class Client {
+    constructor(private server: NetAddress) {
+    }
+
+    public downloadImage() {
+        const fileWriter = new FileWriter(DOWNLOAD_IMAGE_PATH);
+        fileWriter.ready
+            .then((writePart) => DownloadConnection.asPromise(writePart, this.server, ConnectionMode.DownloadImage))
+            .then(() => console.log(`Image downloaded to: ${DOWNLOAD_IMAGE_PATH}`))
+            .catch(console.error)
+            .finally(() => fileWriter.close());
+    }
+
+    public uploadFirmware(filePath: string) {
+        const fileReader = new FileReader(filePath);
+        fileReader.ready
+            .then((readPart) => UploadConnection.asPromise(readPart, this.server, ConnectionMode.SendFirmware))
+            .then(() => console.log('Firmware is uploaded.'))
+            .catch(console.error)
+            .finally(() => {fileReader.close()});
     }
 }
 
