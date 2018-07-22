@@ -149,8 +149,10 @@ abstract class Connection {
     private readonly socket: dgram.Socket;
     public static PART_SIZE: number = 0xff;
     public static WINDOW_SIZE: number = 8;
+    public static PACKET_REPEAT_THRESHOLD = 20;
     protected connectionId: number = 0;
     protected timeout = new Timeout(this.timeoutHandler.bind(this), TIMEOUT);
+    private sendSynPacketCnt = 0;
 
     protected constructor(
         private server: NetAddress,
@@ -206,6 +208,9 @@ abstract class Connection {
     }
 
     protected sendSynPacket() {
+        if (++this.sendSynPacketCnt > Connection.PACKET_REPEAT_THRESHOLD) {
+            throw('could not establish connection');
+        }
         const buff = Buffer.alloc(1);
         buff.writeUInt8(this.connectionMode, 0);
         this.sendPacket(this.createDataPacket(0, 0, ConnectionFlag.SYN, buff));
@@ -351,6 +356,7 @@ class DownloadConnection extends Connection {
  */
 class AutoresolvedBuffer {
     public promise: Promise<Buffer>;
+    public ctr: number = 0;
 
     constructor(
         public offset: number,
@@ -424,8 +430,13 @@ class AutofillWindow {
     }
 
     private sendAutoresolver(autoresolver: AutoresolvedBuffer) {
+        if (autoresolver.ctr > Connection.PACKET_REPEAT_THRESHOLD) {
+            throw('Packet was sent too many times');
+        }
+
         autoresolver.promise.then((buff: Buffer) => {
             if (buff.length) {
+                autoresolver.ctr++;
                 this.sendData(AutofillWindow.getSequenceNumber(autoresolver.offset), buff);
             }
         });
@@ -502,7 +513,7 @@ class AckController {
 class UploadConnection extends Connection {
     private window?: AutofillWindow;
     private ackController?: AckController;
-    private closingConnection: boolean = false;
+    private closingConnection: number = 0;
 
     constructor(
         private getData: (size: number) => Promise<Buffer>,
@@ -516,18 +527,22 @@ class UploadConnection extends Connection {
 
     protected timeoutHandler(): void {
         this.log('TIMEOUT');
-        if (!this.connectionId) {
-            this.sendSynPacket();
-        } else if (this.window) {
-            this.timeout.debounce();
-            if (this.closingConnection) {
-                this.sendFinPacket(this.window.eofSeq);
+        try {
+            if (!this.connectionId) {
+                this.sendSynPacket();
+            } else if (this.window) {
+                this.timeout.debounce();
+                if (this.closingConnection) {
+                    this.sendFinPacket(this.window.eofSeq);
+                } else {
+                    this.window.sendAll();
+                }
             } else {
-                this.window.sendAll();
+                assert(true, 'undefined timeout state');
             }
-
-        } else {
-            assert(true, 'undefined timeout state');
+        } catch (e) {
+            this.sendRstPacket();
+            this.forceCloseConnection(e);
         }
     }
 
@@ -537,8 +552,12 @@ class UploadConnection extends Connection {
     }
 
     protected sendFinPacket(seq: number): void {
-        this.closingConnection = true;
-        return this.sendPacket(this.createPacket(seq, 0, ConnectionFlag.FIN));
+        this.closingConnection++;
+        if (this.closingConnection <= 20) {
+            this.sendPacket(this.createPacket(seq, 0, ConnectionFlag.FIN));
+        } else {
+            throw 'Connection close was not confirmed';
+        }
     }
 
     processDataPacket(packet: Packet) {
@@ -546,8 +565,15 @@ class UploadConnection extends Connection {
             console.error('received data packet but connection undefined');
             return;
         }
+        let valid = false;
 
-        let valid = this.ackController.acknowledge(packet.ackNumber);
+        try {
+            valid = this.ackController.acknowledge(packet.ackNumber);
+        } catch(e) {
+            this.sendRstPacket();
+            return this.forceCloseConnection(e);
+        }
+
         if (this.window.eof) {
             const eofSeq = this.window.eofSeq;
             debug(`eof(seq=${eofSeq})`);
