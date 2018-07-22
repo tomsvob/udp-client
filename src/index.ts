@@ -194,7 +194,7 @@ abstract class Connection {
     }
 
     protected sendRstPacket() {
-        this.sendPacket(this.createPacket(0, 0, ConnectionFlag.RST));
+        this.connectionId && this.sendPacket(this.createPacket(0, 0, ConnectionFlag.RST));
     }
 
     protected abstract sendFinPacket(seq: number): void;
@@ -569,7 +569,7 @@ class UploadConnection extends Connection {
 
         try {
             valid = this.ackController.acknowledge(packet.ackNumber);
-        } catch(e) {
+        } catch (e) {
             this.sendRstPacket();
             return this.forceCloseConnection(e);
         }
@@ -604,7 +604,7 @@ class File {
     protected fileReady: Promise<void>;
 
     constructor(path: string, flag: string) {
-        this.fileReady = File.getFileDescriptor(path, 'r').then((fd) => {
+        this.fileReady = File.getFileDescriptor(path, flag).then((fd) => {
             this.fd = fd;
         });
     }
@@ -630,7 +630,6 @@ class File {
 }
 
 class FileReader extends File {
-    private readChain: Promise<any> = Promise.resolve();
     public ready: Promise<(size: number) => Promise<Buffer>>;
 
     constructor(path: string) {
@@ -639,12 +638,14 @@ class FileReader extends File {
     }
 
     private readPart(size: number): Promise<Buffer> {
-        const oldChain: Promise<Buffer> = this.readChain;
-        return this.readChain = new Promise<Buffer>((res: (msg: Buffer) => void, rej) => oldChain
+        const oldChain = this.fileReady;
+        const newChain = new Promise<Buffer>((res: (msg: Buffer) => void, rej) => oldChain
             .then(() => FileReader.readFilePart(<number> this.fd, size))
             .then(res)
             .catch(rej)
         );
+        this.fileReady = <Promise<any>> newChain;
+        return newChain;
     }
 
     private static readFilePart(fd: number, size: number): Promise<Buffer> {
@@ -667,8 +668,20 @@ class FileWriter extends File {
     }
 
     private writePart(buffer: Buffer) {
-        fs.write(<number> this.fd, buffer, (err: NodeJS.ErrnoException) => {
-            assert(!err, err && err.message);
+        const oldChain = this.fileReady;
+        this.fileReady = new Promise<any>((res: () => void, rej) => oldChain
+            .then(() => FileWriter.writeFilePart(<number> this.fd, buffer))
+            .then(res)
+            .catch(rej)
+        );
+    }
+
+    private static writeFilePart(fd: number, data: Buffer): Promise<Buffer> {
+        return new Promise((res) => {
+            fs.write(fd, data, (err: NodeJS.ErrnoException) => {
+                assert(!err, err && err.message);
+                res();
+            });
         });
     }
 }
@@ -677,11 +690,11 @@ class Client {
     constructor(private server: NetAddress) {
     }
 
-    public downloadImage() {
-        const fileWriter = new FileWriter(DOWNLOAD_IMAGE_PATH);
+    public downloadImage(path: string) {
+        const fileWriter = new FileWriter(path);
         fileWriter.ready
             .then((writePart) => DownloadConnection.asPromise(writePart, this.server, ConnectionMode.DownloadImage))
-            .then(() => console.log(`Image downloaded to: ${DOWNLOAD_IMAGE_PATH}`))
+            .then(() => console.log(`Image downloaded to: ${path}`))
             .catch(console.error)
             .finally(() => fileWriter.close());
     }
@@ -703,7 +716,7 @@ const client = new Client({host: getHost(), port: 4000});
 switch (chooseMode()) {
     case AppMode.DownloadImage:
         console.log('download image');
-        client.downloadImage();
+        client.downloadImage(DOWNLOAD_IMAGE_PATH);
         break;
     case AppMode.SendFirmware:
         console.log('send firmware');
