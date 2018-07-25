@@ -1,3 +1,4 @@
+// author: Tom Svoboda <svobot20@fit.cvut.cz>
 import * as dgram from "dgram";
 import * as fs from "fs";
 import * as promiseFinally from "promise.prototype.finally";
