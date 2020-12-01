@@ -1,11 +1,8 @@
 // author: Tom Svoboda <svobot20@fit.cvut.cz>
 import * as dgram from "dgram";
 import * as fs from "fs";
-import * as promiseFinally from "promise.prototype.finally";
 import * as assert from 'assert';
 import Timer = NodeJS.Timer;
-
-promiseFinally.shim();
 
 const DOWNLOAD_IMAGE_PATH = 'foto.png';
 const TIMEOUT = 100;
@@ -611,8 +608,8 @@ class File {
     }
 
     public static getFileDescriptor(path: string, flags: string): Promise<number> {
-        return new Promise<number>((res, rej) => {
-            fs.open(path, flags, (status: NodeJS.ErrnoException, fd: number) => {
+        return new Promise((res, rej) => {
+            fs.open(path, flags, (status, fd) => {
                 if (status) rej(`file cannot be accessed: ${path}`);
                 else res(fd);
             });
@@ -621,7 +618,7 @@ class File {
 
     public static closeFileDescriptor(fd: number) {
         fs.close(fd, (err) => {
-            assert(!err, err && err.message);
+            assert(!err, err?.message);
         });
     }
 
@@ -640,20 +637,20 @@ class FileReader extends File {
 
     private readPart(size: number): Promise<Buffer> {
         const oldChain = this.fileReady;
-        const newChain = new Promise<Buffer>((res: (msg: Buffer) => void, rej) => oldChain
+        const newChain = new Promise<Buffer>((res, rej) => oldChain
             .then(() => FileReader.readFilePart(<number> this.fd, size))
             .then(res)
             .catch(rej)
         );
-        this.fileReady = <Promise<any>> newChain;
+        this.fileReady = newChain.then();
         return newChain;
     }
 
     private static readFilePart(fd: number, size: number): Promise<Buffer> {
         const buffer = Buffer.allocUnsafe(size);
         return new Promise((res) => {
-            fs.read(fd, buffer, 0, size, null, (err: NodeJS.ErrnoException, bytesRead, buffer) => {
-                assert(!err, err && err.message);
+            fs.read(fd, buffer, 0, size, null, (err, bytesRead, buffer) => {
+                assert(!err, err?.message);
                 res(buffer.slice(0, bytesRead));
             });
         });
@@ -670,17 +667,17 @@ class FileWriter extends File {
 
     private writePart(buffer: Buffer) {
         const oldChain = this.fileReady;
-        this.fileReady = new Promise<any>((res: () => void, rej) => oldChain
+        this.fileReady = new Promise<void>((res, rej) => oldChain
             .then(() => FileWriter.writeFilePart(<number> this.fd, buffer))
             .then(res)
             .catch(rej)
         );
     }
 
-    private static writeFilePart(fd: number, data: Buffer): Promise<Buffer> {
+    private static writeFilePart(fd: number, data: Buffer): Promise<void> {
         return new Promise((res) => {
-            fs.write(fd, data, (err: NodeJS.ErrnoException) => {
-                assert(!err, err && err.message);
+            fs.write(fd, data, (err) => {
+                assert(!err, err?.message);
                 res();
             });
         });
